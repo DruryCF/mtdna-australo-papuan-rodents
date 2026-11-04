@@ -1,0 +1,827 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# load libraries and define file paths
+
+```{r}
+library(tidyverse)
+
+library(phytools)
+library(ape)
+library(TreeTools)
+
+source("common_functions.R")
+```
+
+```{r}
+gene_trees_folder_path <- "full_trees/"
+gene_trees_prefix <- "final_adjusted_alignment_"
+gene_trees_suffix <- "_250729_trimmed_rooted_updated_tips.treefile"
+gene_list <- c("s-rRNA", "l-rRNA", "ND1", "ND2", "COX1", "COX2", "ATP8", "ATP6", "COX3", "ND3", "ND4L", "ND4", "ND5", "ND6", "CYTB")
+levels(gene_list) <- gene_list
+
+# bootstrap analysis trees
+taxa_length_controlled_trees_folder_path <- "length_taxonomy_control/trees/"
+taxa_length_controlled_trees_prefix <- "length_taxonomy_control_"
+taxa_length_controlled_trees_suffix <- "_trimmed_rooted_updated_tips.treefile"
+
+# read in IQTREE file metadata for 200bp length windows
+IQTREE_metadata <- read_csv("rodent_loci_windows/IQTREE_200bp_metadata.csv")
+# get unique rows
+IQTREE_metadata <- IQTREE_metadata %>% 
+  group_by(treefile) %>% 
+  slice(1) %>% 
+  ungroup()
+
+# read in IQTREE file metadata for taxonomy controlled 200bp length windows
+IQTREE_metadata_taxa_control <- read_csv("rodent_loci_windows/taxonomy_control/IQTREE_outfiles/IQTREE_metadata.csv")
+# get unique rows
+IQTREE_metadata_taxa_control <- IQTREE_metadata_taxa_control %>% 
+  group_by(treefile) %>% 
+  slice(1) %>% 
+  ungroup()
+
+# read in 100bp window metadata
+window_metadata_100bp <- read.csv("rodent_loci_windows/rodent_loci_100bp_window_metadata.csv")
+
+# whole mitochondrial tree path
+#whole_mito_tree_path <- "full_trees/final_adjusted_alignment_complete_250729_trimmed_rooted_updated_tips.treefile"
+
+reciprocal_phylogeny_trees_metadata <- read.csv("rodent_loci_windows/reciprocal_monophyly_windows/IQTREE_outfiles/IQTREE_metadata.csv")
+
+# drop duplicate metadata rows caused by multiple runs
+reciprocal_phylogeny_trees_metadata <- reciprocal_phylogeny_trees_metadata %>% distinct()
+```
+
+# read in metadata
+
+```{r}
+# load in metadata
+metadata_full <- readxl::read_xlsx("metadata_U.xlsx", sheet = 1, na = c("", " ", "NA"))
+metadata_full <- metadata_full %>% filter(!is.na(sample_ID))
+
+# create final taxa variables in metadata - when a nuclear DNA confirmed species identification exists, use it, otherwise use the previously determined species identification
+metadata_taxa <- metadata_full %>% mutate(final_genus = case_when(is.na(nuclear_genus) ~ genus,
+                                                    .default = nuclear_genus),
+                                final_species = case_when(is.na(nuclear_genus) ~ species,
+                                                      .default = nuclear_species),
+                                final_phylum = case_when(is.na(nuclear_genus) ~ phylum,
+                                                      .default = nuclear_phylum),
+                                final_class= case_when(is.na(nuclear_genus) ~ class,
+                                                      .default = nuclear_class),
+                                final_order= case_when(is.na(nuclear_genus) ~ order,
+                                                      .default = nuclear_order),
+                                final_family= case_when(is.na(nuclear_genus) ~ family,
+                                                      .default = nuclear_family),
+                                final_subspecies= case_when(is.na(nuclear_genus) ~ subspecies,
+                                                      .default = nuclear_subspecies),
+                                final_tribe= case_when(is.na(nuclear_genus) ~ tribe,
+                                                      .default = nuclear_tribe),
+                                final_division= case_when(is.na(nuclear_genus) ~ division,
+                                                      .default = nuclear_division),
+                                .keep = "unused")
+# remove whitespace
+metadata_taxa <- metadata_taxa %>% mutate(f_genus = str_replace_all(final_genus, " ", ""),
+                                f_species = str_replace_all(final_species, " ", ""),
+                                f_subspecies = str_replace_all(final_subspecies, " ", ""),
+                                number = str_replace_all(voucher_or_tissue_number, " ", ""),
+                                .keep = "unused")
+
+# create Lineage) variable
+metadata_taxa <- metadata_taxa %>% 
+  mutate(lineage = case_when(!is.na(f_subspecies) ~ paste(f_genus, f_species, f_subspecies, sep = "_"),
+                         .default = paste(f_genus, f_species, sep = "_")))
+
+# add tree labels to metadata_taxa
+metadata_taxa <- metadata_taxa %>% 
+  mutate(lineage_plus_specimen_ID = paste(metadata_taxa$lineage, metadata_taxa$number, sep = "_"))
+
+# create full_species_name variable
+metadata_taxa <- metadata_taxa %>% 
+  mutate(full_species_name = paste(f_genus, f_species, sep = "_"))
+
+# rename clade variable
+metadata_taxa <- metadata_taxa %>% 
+  rename(clade = "defined_clade_for_reciprocal_monophyly_criteria")
+
+# store sampleID to clade lookup for getting unique haplotypes for clades
+write_csv(metadata_taxa %>% select(sample_ID, clade), "sample_to_clade_lookup.csv")
+
+# store sampleID to clade lookup for hydromyini only for getting unique haplotypes for clades
+write_csv(metadata_taxa %>% filter(final_tribe == "Hydromyini") %>% select(sample_ID, clade), "hydromyini_sample_to_clade_lookup.csv")
+
+# create lookup table for new names
+lookup_new <- tibble(sample_ID = metadata_taxa$sample_ID, lineage_plus_specimen_ID = paste(metadata_taxa$lineage, metadata_taxa$number, sep = "_"))
+
+# Add lookup for reference - only relevant for mito trees not trimmed to Hydromyini and outgroup only
+reference_label <- tibble(sample_ID = "mus_musculus_reference_NC_005089.1", lineage_plus_specimen_ID = "mus_musculus_reference_NC_005089.1")
+
+lookup_new <- rbind(reference_label, lookup_new)
+```
+
+```{r}
+# update IQTREE filepath labels in metadata
+
+# create empty vector to store filepath labels
+new_filepath_list <- c()
+
+for (n in 1:length(IQTREE_metadata$treefile)) {
+  
+  # get tree directory
+  tree_directory <- dirname(IQTREE_metadata$treefile[n])
+  
+  # get treefile_name
+  treefile_name <- tools::file_path_sans_ext(basename(IQTREE_metadata$treefile[n]))
+  
+  # create new filename for updated tips tree
+  new_filepath <- paste0(tree_directory, "/", treefile_name, "_trimmed_rooted_updated_tips.treefile")
+
+  # store filepath to updated tree
+  new_filepath_list <- c(new_filepath_list, new_filepath)
+  
+}
+
+# add updated_tips trees to IQTREE metadata
+IQTREE_metadata$updated_tips <- new_filepath_list
+
+
+
+
+
+# create empty vector to store filepath labels
+new_filepath_list <- c()
+
+for (n in 1:length(IQTREE_metadata_taxa_control$treefile)) {
+  
+  # get tree directory
+  tree_directory <- dirname(IQTREE_metadata_taxa_control$treefile[n])
+  
+  # get treefile_name
+  treefile_name <- tools::file_path_sans_ext(basename(IQTREE_metadata_taxa_control$treefile[n]))
+  
+  # create new filename for updated tips tree
+  new_filepath <- paste0(tree_directory, "/", treefile_name, "_trimmed_rooted_updated_tips.treefile")
+
+  # store filepath to updated tree
+  new_filepath_list <- c(new_filepath_list, new_filepath)
+  
+}
+
+# add updated_tips trees to IQTREE metadata
+IQTREE_metadata_taxa_control$updated_tips <- new_filepath_list
+```
+
+# calculate average bootstrap score across taxonomy controlled 200bp window trees
+
+```{r}
+# calculate average bootstrap across taxonomy controlled, 200bp window trees
+taxa_length_controlled_bootstrap <- average_bootstrap(IQTREE_metadata_taxa_control$updated_tips, "", "", "")
+
+# rename loci variable to treefile
+taxa_length_controlled_bootstrap$full_bootstrap_values <- 
+  taxa_length_controlled_bootstrap$full_bootstrap_values %>% 
+  rename(updated_tips = "loci")
+
+# join metadata
+taxa_length_controlled_bootstrap$full_bootstrap_values <- 
+  left_join(taxa_length_controlled_bootstrap$full_bootstrap_values,
+            IQTREE_metadata_taxa_control, by = c("updated_tips")) %>% 
+  rename(loci = "updated_tips")
+
+taxa_length_controlled_bootstrap$full_bootstrap_values <- taxa_length_controlled_bootstrap$full_bootstrap_values %>% 
+  mutate(loci = basename(loci)) %>% # get base file name
+  mutate(loci = str_split_fixed(loci, "_", n = 2)[,1]) # get loci prefix
+
+# recalculate average bootstrap score per loci and overwrite average_bootstrap_table
+taxa_length_controlled_bootstrap$average_bootstrap_table <- taxa_length_controlled_bootstrap$full_bootstrap_values %>% 
+  group_by(loci) %>% 
+  summarise(average_bootstrap_score = mean(bootstrap),
+            variance = var(bootstrap),
+            standard_deviation = sd(bootstrap),
+            standard_error = sd(bootstrap)/sqrt(length(bootstrap))) %>% 
+  ungroup()
+
+# additionally calculate average bootstrap score by window
+average_bootstrap_over_windows <- 
+  taxa_length_controlled_bootstrap$full_bootstrap_values %>% 
+  group_by(loci, alignment_start_position,alignment_end_position,reference_start_position,reference_end_position) %>% 
+  summarise(average_bootstrap_score = mean(bootstrap),
+            variance = var(bootstrap),
+            standard_deviation = sd(bootstrap),
+            standard_error = sd(bootstrap)/sqrt(length(bootstrap))) %>% 
+  ungroup()
+
+
+# combine bootstrap tables
+average_bootstrap_values <- taxa_length_controlled_bootstrap$average_bootstrap_table
+full_bootstrap_values <- taxa_length_controlled_bootstrap$full_bootstrap_values
+```
+
+# Determine windows for reciprocal monophyly analysis
+
+```{r}
+# access windows with minimum 80% bootstrap + broad distribution to compare bootstrap w/ RM
+
+best_bootstrap <- average_bootstrap_over_windows %>% 
+  filter(average_bootstrap_score >= 80)
+
+broad_bootstrap <- average_bootstrap_over_windows %>% 
+  mutate(rounded_average = round(average_bootstrap_score)) %>% 
+  filter(rounded_average < 80) %>% 
+  arrange(rounded_average) %>% 
+  group_by(rounded_average) %>% 
+  slice(1)
+
+# get alignment start positions
+alignment_starts <- c(best_bootstrap$alignment_start_position, broad_bootstrap$alignment_start_position)
+
+# get alignment end positions
+alignment_ends <- c(best_bootstrap$alignment_end_position, broad_bootstrap$alignment_end_position)
+
+# access IQTREE_metadata for length control to retrieve alignment file paths
+reciprocal_monophyly_windows_metadata <- IQTREE_metadata %>% 
+  filter(alignment_start_position %in% alignment_starts) %>% 
+  select(!c(updated_tips, treefile, minimum_coverage_file)) # drop variables generated by IQTREE
+
+# get matching 100bp windows
+for (n in 1:length(alignment_starts)) {
+  
+  window_start <- alignment_starts[n]
+  window_end <- alignment_ends[n]
+  
+  # filter 100bp metadata for window between 200bp start and end positions
+  matching_100bp_window <- window_metadata_100bp %>% 
+    filter(alignment_start_position > window_start) %>% 
+    filter(alignment_end_position < window_end)
+  
+  # add 100bp window metadata to reciprocal monophyly window metadata
+  reciprocal_monophyly_windows_metadata <-
+    rbind(reciprocal_monophyly_windows_metadata, matching_100bp_window)
+  
+}
+
+write_csv(reciprocal_monophyly_windows_metadata, file = "reciprocal_monophyly_windows_metadata.csv")
+
+reciprocal_monophyly_windows_metadata
+```
+
+# Determine reciprocal monophyly for selected 200bp and associated 100bp window trees
+
+```{r}
+# colour branches by clade for reciprocal monophyly determination
+
+# create colour lookup
+
+lookup_colour <- tibble(lineage_plus_specimen_ID = paste(metadata_taxa$lineage, metadata_taxa$number, sep = "_"), tribe = metadata_taxa$final_tribe, clade = metadata_taxa$clade)
+
+# update bracket characters to hyphens as tip.label does not support brackets
+lookup_colour$lineage_plus_specimen_ID <- str_replace_all(lookup_colour$lineage_plus_specimen_ID,"[(]","-")
+lookup_colour$lineage_plus_specimen_ID <- str_replace_all(lookup_colour$lineage_plus_specimen_ID,"[)]","-")
+lookup_colour$clade <- str_replace_all(lookup_colour$clade,"[(]","-")
+lookup_colour$clade <- str_replace_all(lookup_colour$clade,"[)]","-")
+
+# filter for only Hydromyini species
+lookup_colour <- lookup_colour %>% 
+  filter(tribe == "Hydromyini") %>%
+  select(!tribe)
+
+# convert not to be considered for RM to individual clade values - i.e each assembly in these clades will be considered individually rather than as a group
+not_to_be_considered <- lookup_colour %>%
+  filter(clade %in% c("Uromys_caudimaculatus", #excluded due to taxonomic uncertainty
+                      "Pogonomelomys_mayeri", #excluded due to non-monophyly in a nuclear phylogeny (Roycroft et al., 2022)
+                      "Melomys_burtoni", #excluded due to taxonomic uncertainty and non-monophyly in whole mitogenome phylogeny
+                      "Melomys_lutillus")) %>% #excluded due to taxonomic uncertainty and non-monophyly in whole mitogenome phylogeny
+  mutate(clade = paste(clade, row_number(), sep = "_"))
+
+# rbind not to be considered clades and filter out original clade names
+lookup_colour <- rbind(lookup_colour, not_to_be_considered)
+lookup_colour <- lookup_colour %>% 
+  filter(!(clade %in% c("Uromys_caudimaculatus",
+                        "Pogonomelomys_mayeri",
+                        "Melomys_burtoni",
+                        "Melomys_lutillus")))
+
+# get one row per label in tree - duplicates caused by multiple libraries derived from same individual in metadata
+lookup_colour <- lookup_colour %>% 
+  group_by(lineage_plus_specimen_ID) %>% 
+  slice(1) %>% 
+  ungroup()
+
+# ALTERNATE LOOKUP WITH NT AND WA DELICATULUS LISTED SEPARATELY
+alternate_delicatulus <- metadata_taxa %>% 
+  filter(clade == "Pseudomys_delicatulus") %>% 
+  mutate(clade = case_when(state_or_region == "Northern Territory" ~ paste0(clade, "_NT"),
+                           state_or_region == "Western Australia" ~ paste0(clade, "_WA"))) %>% 
+  select(lineage_plus_specimen_ID, clade) %>% 
+  group_by(lineage_plus_specimen_ID) %>% # drop multiple rows per tree label
+  slice(1) %>% 
+  ungroup()  
+
+lookup_colour <- rbind(lookup_colour, alternate_delicatulus)
+```
+
+```{r}
+# root all trees on mus_musculus and update tip labels
+
+# create empty vector to store filepath labels
+new_filepath_list <- c()
+
+for (n in 1:length(reciprocal_phylogeny_trees_metadata$treefile)) {
+
+  original_tree <- read.tree(reciprocal_phylogeny_trees_metadata$treefile[n])
+  
+  # root on mus musculus
+  
+  root_reference <- original_tree$tip.label[grep("NC_005089", original_tree$tip.label)]
+  
+  rooted_tree <- RootTree(original_tree, root_reference)
+  
+  # get tree directory
+  tree_directory <- dirname(reciprocal_phylogeny_trees_metadata$treefile[n])
+  
+  # get treefile_name
+  treefile_name <- tools::file_path_sans_ext(basename(reciprocal_phylogeny_trees_metadata$treefile[n]))
+  
+  # create new filename for rerooted tree
+  new_filepath <- paste0(tree_directory, "/", treefile_name, "_trimmed_rooted.treefile")
+  
+  write.tree(rooted_tree, new_filepath)
+
+  # update tip labels
+  rooted_tree_updated_tips_sample_ID <- rename_tips_sample_ID(rooted_tree, add_names_old = "NC_005089.1", add_names_new = "mus_musculus_reference_NC_005089.1")
+  
+  # add reference ID to tmp lookup table
+  
+  reference_label <- tibble(sample_ID = "mus_musculus_reference_NC_005089.1",
+                            lineage_plus_specimen_ID = "mus_musculus_reference_NC_005089.1")
+
+lookup_new_tmp <- rbind(reference_label, lookup_new)
+  
+  rooted_tree_updated_tips_lineage <- rename_tips(rooted_tree_updated_tips_sample_ID, lookup_new_tmp$sample_ID, lookup_new_tmp$lineage_plus_specimen_ID)
+  
+  # create new filename for updated tips tree
+  new_filepath <- paste0(tree_directory, "/", treefile_name, "_trimmed_rooted_updated_tips.treefile")
+  
+  write.tree(rooted_tree_updated_tips_lineage, new_filepath)
+
+  # store filepath to updated tree
+  new_filepath_list <- c(new_filepath_list, new_filepath)
+  
+}
+
+# add updated_tips trees to IQTREE metadata
+reciprocal_phylogeny_trees_metadata$updated_tips <- new_filepath_list
+```
+
+#### Reciprocal Monophyly Classification
+
+```{r}
+# auto-calculate Reciprocal Monophyly
+
+# create empty tibbles to store overall reciprocal monophyly determination
+clade_stats <- NULL
+
+# create empty object to store included ineligible tips
+all_included_ineligible <- NULL
+
+# create empty object to store all clade counts
+clade_representatives <- NULL
+
+# read in trees
+
+for (tree_number in 1:nrow(reciprocal_phylogeny_trees_metadata)) {
+  
+  # create null object for tree clade stats
+  tree_clade_stats <- NULL
+
+reciprocal_phylogeny_tree <- read.tree(reciprocal_phylogeny_trees_metadata$updated_tips[tree_number])
+
+# get intersection of labels in tree and labels in colour lookup
+common_labels <- intersect(reciprocal_phylogeny_tree$tip.label, lookup_colour$lineage_plus_specimen_ID)
+
+# filter colour lookup to tips in tree
+lookup_colour_tmp <- lookup_colour %>% 
+  filter(lineage_plus_specimen_ID %in% common_labels)
+
+# get list of clades with at least 3 representatives (eligible for classification as monophyletic or reciprocally monophyletic)
+clade_colour_list <- lookup_colour_tmp %>%
+  group_by(clade) %>% 
+  summarise(count = n()) %>% 
+  filter(count >= 3)
+
+clade_colour_list <- clade_colour_list$clade
+
+# get list of clades with 2x representatives
+multi_represented_ineligible <- lookup_colour_tmp %>%
+  group_by(clade) %>% 
+  summarise(count = n()) %>% 
+  filter(count == 2)
+
+multi_represented_ineligible <- multi_represented_ineligible$clade
+
+# get list of clades with 1x representatives
+single_represented_ineligible <- lookup_colour_tmp %>%
+  group_by(clade) %>% 
+  summarise(count = n()) %>% 
+  filter(count == 1)
+single_represented_ineligible <- lookup_colour_tmp %>% filter(clade %in% single_represented_ineligible$clade)
+single_represented_ineligible <- single_represented_ineligible$lineage_plus_specimen_ID
+
+# create tibble for tip labels and include tip number in tree
+tip_labels_list <- tibble(tip_labels = reciprocal_phylogeny_tree$tip.label)
+tip_labels_list <- tip_labels_list %>% 
+  mutate(tip_number = row_number())
+
+# create NULL remove object for storing tips to remove
+remove <- NULL
+
+# loop over clades with 2x representatives to determine if they will be retained as comparisons in the reciprocal monophyly classification; retained if they are sisters in the tree
+for (clade in 1:length(multi_represented_ineligible)) {
+  
+  current_clade <- multi_represented_ineligible[clade]
+  
+  # get tip labels for clade
+  current_tips <- lookup_colour_tmp %>% filter(clade == current_clade)
+  current_tips <- current_tips$lineage_plus_specimen_ID
+  
+  # get MRCA for tips
+  MRCA_of_ineligible <- getMRCA(reciprocal_phylogeny_tree, current_tips)
+  
+  # get tip number of ineligible tips
+  ineligible_tip_numbers <- tip_labels_list %>% 
+    filter(tip_labels %in% current_tips)
+  ineligible_tip_numbers <- ineligible_tip_numbers$tip_number
+  
+  # get descendants of MRCA
+  ineligible_descendants <- getDescendants(reciprocal_phylogeny_tree, MRCA_of_ineligible)
+  
+  # filter tip label numbers for ineligible descendants to exclude internal nodes
+  ineligible_descendants <- tip_labels_list %>% 
+    filter(tip_number %in% ineligible_descendants)
+  ineligible_descendants <- ineligible_descendants$tip_number
+  
+  # check that length of ineligible tip numbers and ineligible descendants are equal - if not, tips are not sister and should be excluded
+  if (length(ineligible_descendants) != length(ineligible_tip_numbers)) {
+    # more descendants than expected, add tip labels to remove list
+    remove <- c(remove, current_tips)
+  }
+}
+
+# loop over clades with 1x representative to determine if they will be retained as comparisons in the reciprocal monophyly classification; retained if >=80 bootstrap support
+for (tip in 1:length(single_represented_ineligible)) {
+  no_clade_tip_label <- single_represented_ineligible[tip]
+  sister_node <- getSisters(reciprocal_phylogeny_tree, no_clade_tip_label)
+  shared_node <- getParent(reciprocal_phylogeny_tree, sister_node)
+  # subtract tip labels from node number to get corresponding node label number
+  node_label_number <- shared_node - length(reciprocal_phylogeny_tree$tip.label)
+  bootstrap_value_of_node <- reciprocal_phylogeny_tree$node.label[node_label_number]
+  # extract bootstrap from SH-aLRT - if blank assume identical
+  if (bootstrap_value_of_node == "") {
+    bootstrap_value_of_node <- 100
+  } else {
+    bootstrap_value_of_node <- str_split_i(bootstrap_value_of_node, pattern = "/", i = 2)
+    bootstrap_value_of_node <- as.numeric(bootstrap_value_of_node)
+  }
+  # if bootstrap below threshold of 80, add to remove tip list
+  if (bootstrap_value_of_node < 80) {
+    remove <- c(remove, no_clade_tip_label)
+  }
+}
+
+# remove clades with 1x and 2x representatives that fail bootstrap support/sister tests
+reciprocal_phylogeny_tree <- drop.tip(reciprocal_phylogeny_tree, reciprocal_phylogeny_tree$tip.label[match(remove, reciprocal_phylogeny_tree$tip.label)])
+
+# redefine colour lookup to new included tips and save as new tmp lookup
+common_labels <- intersect(reciprocal_phylogeny_tree$tip.label,
+                           lookup_colour_tmp$lineage_plus_specimen_ID)
+
+lookup_colour_all_tmp <- lookup_colour_tmp %>% 
+  filter(lineage_plus_specimen_ID %in% common_labels)
+
+# redefine colour lookup to only contain reciprocally monophyletic eligible sequences
+lookup_colour_tmp <- lookup_colour_tmp %>% 
+  filter(clade %in% clade_colour_list)
+
+# save separate list of included RM ineligible sequences
+included_ineligible <- lookup_colour_all_tmp %>% 
+  filter(!(clade %in% clade_colour_list))
+
+## Remove partially complete assemblies if not required to make up minimum 3x individuals - will exclude sequences 80-95% complete across windows if clade has sufficient >95% complete representatives, all <80% assemblies removed prior to phylogeny generation
+
+# get treefile_name
+treefile_name <- tools::file_path_sans_ext(basename(reciprocal_phylogeny_trees_metadata$treefile[tree_number]))
+
+# read in coverage.csv
+sequence_coverage <- read_csv(paste0("rodent_loci_windows/reciprocal_monophyly_windows/sequence_coverage_data/", treefile_name, "_count_bp.csv"))
+
+# drop NAs for coverage
+sequence_coverage <- sequence_coverage %>% 
+  filter(!is.na(num_bp))
+
+# join metadata to sequence coverage by sample_ID to get names in tree
+sequence_coverage <- left_join(sequence_coverage,
+                               metadata_taxa %>% select(sample_ID, lineage_plus_specimen_ID),
+                               by = "sample_ID")
+# update bracket characters to hyphens in lineages as tip.label does not support brackets
+sequence_coverage$lineage_plus_specimen_ID <-
+  str_replace_all(sequence_coverage$lineage_plus_specimen_ID,"[(]","-")
+sequence_coverage$lineage_plus_specimen_ID <-
+  str_replace_all(sequence_coverage$lineage_plus_specimen_ID,"[)]","-")
+
+# join sequence coverage to eligible lookup table by name in tree
+sequence_coverage <- left_join(lookup_colour_tmp, sequence_coverage, by = "lineage_plus_specimen_ID")
+
+# filter for minimum 95% coverage then count representatives per clade
+high_sequence_coverage_samples <- sequence_coverage %>% 
+  filter(coverage >= .95)
+high_sequence_coverage_clades <- high_sequence_coverage_samples %>% 
+  group_by(clade) %>% 
+  summarise(count = n()) %>% 
+  filter(count >= 3)
+high_sequence_coverage_clades <- high_sequence_coverage_clades$clade
+
+# filter high coverage samples for only those with minimum three high coverage clade reps
+high_sequence_coverage_samples <- high_sequence_coverage_samples %>% 
+  filter(clade %in% high_sequence_coverage_clades) %>% 
+  select(lineage_plus_specimen_ID, clade)
+
+# filter sequence coverage for clades NOT represented by minimum 3 high coverage reps
+low_sequence_coverage_samples <- sequence_coverage %>% 
+  filter(!(clade %in% high_sequence_coverage_clades))
+
+# create new tree label for included low coverage, note low sequence coverage samples does include high coverage samples for clades with less than 3 high coverage representatives
+actually_low_sequence_coverage_samples <- low_sequence_coverage_samples %>% 
+  filter(coverage < .95) %>% 
+  mutate(new_label = paste(lineage_plus_specimen_ID, "LOW_COVERAGE", coverage, sep = "_"))
+
+# get samples to remove from lookup and tree by subsetting lookup to tree labels NOT in low or high coverage lists
+remove <- lookup_colour_tmp %>% 
+  filter(!(lineage_plus_specimen_ID %in% c(high_sequence_coverage_samples$lineage_plus_specimen_ID,
+                                       low_sequence_coverage_samples$lineage_plus_specimen_ID)))
+remove <- remove$lineage_plus_specimen_ID
+
+# redefine both lookups to exclude remove samples
+lookup_colour_tmp <- lookup_colour_tmp %>% 
+  filter(!(lineage_plus_specimen_ID %in% remove))
+lookup_colour_all_tmp <- lookup_colour_all_tmp %>% 
+  filter(!(lineage_plus_specimen_ID %in% remove))
+
+# drop excluded low coverage samples from tree
+reciprocal_phylogeny_tree <- drop.tip(reciprocal_phylogeny_tree, reciprocal_phylogeny_tree$tip.label[match(remove, reciprocal_phylogeny_tree$tip.label)])
+
+# if actually low coverage has rows redefine lookups to have new low coverage tree labels
+if (nrow(actually_low_sequence_coverage_samples) > 0) {
+  lookup_colour_tmp <- left_join(lookup_colour_tmp, actually_low_sequence_coverage_samples) %>% 
+    mutate(lineage_plus_specimen_ID = case_when(!is.na(new_label) ~ new_label,
+                                            .default = lineage_plus_specimen_ID),
+           .keep = "unused",
+           .before = 0)
+  
+  lookup_colour_all_tmp <- left_join(lookup_colour_all_tmp,
+                                     actually_low_sequence_coverage_samples) %>%
+    mutate(old_label = lineage_plus_specimen_ID) %>% 
+    mutate(lineage_plus_specimen_ID = case_when(!is.na(new_label) ~ new_label,
+                                            .default = lineage_plus_specimen_ID),
+           .keep = "unused",
+           .before = 0)
+  
+  # rename labels in tree
+  reciprocal_phylogeny_tree <- rename_tips(reciprocal_phylogeny_tree,
+                                           lookup_colour_all_tmp$old_label,
+                                           lookup_colour_all_tmp$lineage_plus_specimen_ID)
+  
+  # drop old labels column for all lookup
+  lookup_colour_all_tmp <- lookup_colour_all_tmp %>% 
+    select(!old_label)
+  
+  # Print if low
+  print(treefile_name)
+  print(actually_low_sequence_coverage_samples)
+    
+}
+
+## FINISH: FILTER OUT INCOMPLETE SEQUENCES WHEN NOT NEEDED TO MAKE UP MINIMUM 3 INDIVIDUALS
+
+# colour tree
+list_clades <- lookup_colour_tmp %>% group_by(clade) %>% summarise()
+list_clades <- list_clades$clade
+
+# create new tree object for labeling with clade IDs
+labelled_reciprocal_phylogeny_tree <- reciprocal_phylogeny_tree
+  
+  # convert tip labels in tree to tibble
+  tree_tip_labels <- tibble(tips = labelled_reciprocal_phylogeny_tree$tip.label)
+  # add row_numbers for tip labels
+  tree_tip_labels <- tree_tip_labels %>% 
+    mutate(tip_number = row_number())
+
+# paint edges eligible for reciprocal monophyly proportion
+for (c in 1:length(list_clades)) {
+  current_clade <- list_clades[c]
+  
+  # get tip labels in current clade
+  tiplabels_to_colour <- lookup_colour_tmp %>% filter(clade == current_clade)
+  tiplabels_to_colour <- tiplabels_to_colour$lineage_plus_specimen_ID
+  
+  # get common ancestor of clade for auto determination of reciprocal monophyly
+  clade_node_label <- findMRCA(labelled_reciprocal_phylogeny_tree, tiplabels_to_colour)
+  
+  # check if monophyletic
+  
+  # get descendants of clade MRCA
+  descendant_nodes <- getDescendants(labelled_reciprocal_phylogeny_tree, clade_node_label)
+  
+  # remove expected clade tips from tip labels in tree then subset to descendent nodes matching tip labels
+  tmp_tree_tip_labels <- tree_tip_labels %>% 
+    filter(!(tips %in% tiplabels_to_colour)) %>% 
+    filter(tip_number %in% descendant_nodes)
+  
+  # if tmp_tree_tip_labels has rows then monophyly is no
+  if (nrow(tmp_tree_tip_labels) == 0) {
+    is_clade_monophyletic <- "yes"
+    is_clade_reciprocally_monophyletic <- "yes" # temp set, will overwrite if not true
+  } else {
+    is_clade_monophyletic <- "no"
+    is_clade_reciprocally_monophyletic <- "no"
+  }
+  
+  # if clade is monophyletic, check if sister clade includes all descendants of included clades
+  if (is_clade_monophyletic == "yes") {
+    
+    # get sister node
+    sister_clade_node <- getSisters(labelled_reciprocal_phylogeny_tree, clade_node_label)
+    
+    # if sister clade node is equal to or less than number of tips, equals single tip (tip labels numbered 1 to n)
+    if (sister_clade_node <= nrow(tree_tip_labels)) {
+      # set sister_desc_nodes equal to sister clade node
+      sister_desc_nodes <- sister_clade_node
+    } else {
+      
+      # get sister node descendants
+      sister_desc_nodes <- getDescendants(labelled_reciprocal_phylogeny_tree, sister_clade_node)
+      
+    }
+    
+    # get tip labels of descendants
+    tmp_tree_tip_labels <- tree_tip_labels %>% 
+      filter(tip_number %in% sister_desc_nodes)
+    
+    # get clades of descendants
+    descendant_nuclear_clades <- lookup_colour_all_tmp %>%
+      filter(lineage_plus_specimen_ID %in% tmp_tree_tip_labels$tips)
+    
+    # if current clade = P. delicatulus, drop sub clades from consideration
+    if (current_clade == "Pseudomys_delicatulus") {
+      descendant_nuclear_clades <- descendant_nuclear_clades %>% 
+        filter(!(clade %in% c("Pseudomys_delicatulus_NT", "Pseudomys_delicatulus_WA")))
+    } else {
+      # if current clade = anything else, drop overall clade from consideration - if overall clade is sister, will still be reciprocal even if geographic delicatulus not in reciprocal clades
+      descendant_nuclear_clades <- descendant_nuclear_clades %>% 
+        filter(!(clade == "Pseudomys_delicatulus"))
+    }
+    
+    # get clades as list
+    descendant_nuclear_clades <- unique(descendant_nuclear_clades$clade)
+    
+    # get MRCA of all descendant of clades
+    for (clade in 1:length(descendant_nuclear_clades)) {
+      
+      # get current clade
+      current_clade_for_RM <- descendant_nuclear_clades[clade]
+      
+      # get all tips for current clade
+      all_tips_for_RM_check <- lookup_colour_all_tmp %>% filter(clade == current_clade_for_RM)
+      
+      # get MRCA of all tips
+      MRCA_of_nuclear_clade <- findMRCA(labelled_reciprocal_phylogeny_tree, all_tips_for_RM_check$lineage_plus_specimen_ID)
+      
+      # if MRCA is NULL, then sister is single representative of clade, consider as RM
+      # if MRCA is NOT NULL, then check that sister clade includes all nuclear clade descendants
+      if (!is.null(MRCA_of_nuclear_clade)) {
+        
+        # create tmp list of sister node clade and descendant nodes
+        sister_all_nodes <- c(sister_clade_node, sister_desc_nodes)
+        
+        # check if MRCA is equal to sister clade or included in sister clade nodes
+        if (MRCA_of_nuclear_clade %in% sister_all_nodes) {
+          # do not set RM
+        } else {
+          # set Reciprocal monophyly to no
+          is_clade_reciprocally_monophyletic <- "no"
+        }
+        
+      }
+      
+    }
+    
+  }
+  
+  # write clade monophyly information
+    tmp_clade_stats <- tibble(length = reciprocal_phylogeny_trees_metadata$window_length[tree_number], start_position = reciprocal_phylogeny_trees_metadata$alignment_start_position[tree_number], end_position = reciprocal_phylogeny_trees_metadata$alignment_end_position[tree_number], clade = current_clade, reciprocal_monophyly = is_clade_reciprocally_monophyletic, monophyly = is_clade_monophyletic, clade_node = clade_node_label)
+    
+    # append to overall
+    clade_stats <- rbind(clade_stats, tmp_clade_stats)
+    
+    # append to tree only clade stats
+    tree_clade_stats <- rbind(tree_clade_stats, tmp_clade_stats)
+    
+}
+  
+  
+# write included ineligible tips information
+tmp_included_ineligible <- included_ineligible %>% 
+  mutate(length = reciprocal_phylogeny_trees_metadata$window_length[tree_number],
+         start_position = reciprocal_phylogeny_trees_metadata$alignment_start_position[tree_number],
+         end_position = reciprocal_phylogeny_trees_metadata$alignment_end_position[tree_number])
+
+# add to overall tibble
+all_included_ineligible <- rbind(all_included_ineligible, tmp_included_ineligible)
+
+# write ALL included tips information
+tmp_clade_representatives <- lookup_colour_all_tmp %>% 
+  select(lineage_plus_specimen_ID, clade) %>% 
+  mutate(length = reciprocal_phylogeny_trees_metadata$window_length[tree_number],
+         start_position = reciprocal_phylogeny_trees_metadata$alignment_start_position[tree_number],
+         end_position = reciprocal_phylogeny_trees_metadata$alignment_end_position[tree_number])
+
+# add to overall tibble
+clade_representatives <- rbind(clade_representatives, tmp_clade_representatives)
+
+## mutate tree clade stats for joint reciprocal monophyly_monophyly state
+tree_clade_stats <- tree_clade_stats %>%
+  mutate(RM_M = paste(reciprocal_monophyly, monophyly, sep = "_")) %>% 
+  mutate(RM_M = case_when(RM_M == "no_no" ~ "neither",
+                          RM_M == "yes_yes" ~ "reciprocal",
+                          RM_M == "no_yes" ~ "monophyletic")) %>% 
+  arrange(clade_node) # arrange tree clade stats by clade node
+
+# close loop through trees    
+}
+
+# save clade_representative as .csv
+write_csv(clade_representatives, "window_clade_representatives.csv")
+
+# create consensus delicatulus - if both subclades are RM OR whole clade is RM, then consensus is RM
+delicatulus_consensus <- clade_stats %>% 
+  filter(clade %in% c("Pseudomys_delicatulus", "Pseudomys_delicatulus_NT", "Pseudomys_delicatulus_WA")) %>% 
+  select(!c(clade_node, monophyly)) %>% 
+  pivot_wider(names_from = clade, values_from = reciprocal_monophyly) %>% 
+  mutate(Pseudomys_delicatulus_consensus = case_when(Pseudomys_delicatulus == "yes" ~ "yes",
+                                                     Pseudomys_delicatulus == "no" &
+                                                       Pseudomys_delicatulus_NT == "yes" &
+                                                       Pseudomys_delicatulus_WA == "yes" ~ "yes",
+                                                     .default = "no")) %>% 
+  pivot_longer(cols = -c(length, start_position, end_position), values_to = "reciprocal_monophyly", names_to = "clade") %>% 
+  filter(clade == "Pseudomys_delicatulus_consensus")
+# consensus will inherit monophyly and clade node from overall clade - EXCEPT WHEN RM, THEN COUNTED AS MONOPHYLETIC FOR PLOT PURPOSES
+delicatulus_consensus <- left_join(delicatulus_consensus, clade_stats %>% filter(clade == "Pseudomys_delicatulus") %>% select(!c(clade, reciprocal_monophyly)), join_by(length, start_position, end_position))
+delicatulus_consensus <- delicatulus_consensus %>% 
+  mutate(monophyly = case_when(reciprocal_monophyly == "yes" ~ "yes",
+                               .default = monophyly))
+# join consensus to clade stats
+clade_stats <- rbind(clade_stats, delicatulus_consensus)
+
+# make clade_stats rows distinct to prevent rerun error that inflates consensus delicatulus
+clade_stats <- clade_stats %>% distinct()
+
+
+
+# calculate proportion - CALCULATE ONLY CONSENSUS DELICATULUS, NOT OTHERS
+overall_reciprocal_monophyly_proportion_2 <- clade_stats %>% 
+  filter(!(clade %in% c("Pseudomys_delicatulus", "Pseudomys_delicatulus_NT", "Pseudomys_delicatulus_WA"))) %>% 
+  pivot_longer(cols = c(reciprocal_monophyly, monophyly), values_to = "yes_no", names_to = "monophyly_type") %>% 
+  group_by(length, start_position, end_position, monophyly_type, yes_no) %>% 
+  summarise(count = n())
+
+# get total number of considered clades
+total_clades <- overall_reciprocal_monophyly_proportion_2 %>% 
+  group_by(length, start_position, end_position, monophyly_type) %>% 
+  summarise(total_clades = sum(count))
+
+# join total_clades
+overall_reciprocal_monophyly_proportion_2 <-
+  left_join(overall_reciprocal_monophyly_proportion_2,
+            total_clades, by = c("length", "start_position", "end_position", "monophyly_type"))
+
+# calculate proportion
+overall_reciprocal_monophyly_proportion_2 <- overall_reciprocal_monophyly_proportion_2 %>% 
+  mutate(proportion = count / total_clades)
+
+# convert length and position to character
+overall_reciprocal_monophyly_proportion_2$length <- as.character(overall_reciprocal_monophyly_proportion_2$length)
+overall_reciprocal_monophyly_proportion_2$start_position <- as.character(overall_reciprocal_monophyly_proportion_2$start_position)
+overall_reciprocal_monophyly_proportion_2$end_position <- as.character(overall_reciprocal_monophyly_proportion_2$end_position)
+```
+
+# Reciprocal Monophyly Classification - Results
+
+```{r}
+# reciprocal monophyly results for each clade in each tested window
+clade_stats
+
+
+# summarised reciprocal monophyly results for each window - reports number of clades (count) that are/are not (yes_no) monophyletic or reciprocally monophyletic. Proportion is count of corresponding monophyly criteria (e.g. not monophyletic) / total clades that were considered for reciprocal monophyly criterion in the given window
+overall_reciprocal_monophyly_proportion_2
+```

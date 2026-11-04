@@ -1,0 +1,243 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# read in metadata
+
+```{r}
+# get mitogenome database metadata
+stats_plus_metadata <- readxl::read_xlsx("mitogenome_database_metadata.xlsx", sheet = 1, na = c("", " ", "NA"))
+
+# remove whitespace
+stats_plus_metadata <- stats_plus_metadata %>%
+  mutate(ID_number = str_replace_all(ID_number, " ", ""),
+                                  .keep = "unused"
+         )
+
+
+# load in full sequence dataset metadata
+metadata_full <- readxl::read_xlsx("metadata_U.xlsx", sheet = 1, na = c("", " ", "NA"))
+metadata_full <- metadata_full %>% filter(!is.na(sample_ID))
+
+# create final taxa variables in metadata - when a nuclear DNA confirmed species identification exists, use it, otherwise use the previously determined species identification
+metadata_taxa <- metadata_full %>% mutate(final_genus = case_when(is.na(nuclear_genus) ~ genus,
+                                                    .default = nuclear_genus),
+                                final_species = case_when(is.na(nuclear_genus) ~ species,
+                                                      .default = nuclear_species),
+                                .keep = "unused")
+# remove whitespace
+metadata_taxa <- metadata_taxa %>% mutate(f_genus = str_replace_all(final_genus, " ", ""),
+                                f_species = str_replace_all(final_species, " ", ""),
+                                number = str_replace_all(voucher_or_tissue_number, " ", ""),
+                                .keep = "unused")
+
+# create full_species_name variable
+metadata_taxa <- metadata_taxa %>% 
+  mutate(full_species_name = paste(f_genus, f_species, sep = "_"))
+```
+
+# geography vs completeness statistical analysis
+
+```{r}
+# create adjusted country groups
+stats_plus_metadata_adjusted_country <- stats_plus_metadata %>% 
+  mutate(country = case_when(geographic_region %in% c("East New Guinea", "Bismarck Archipelago") ~ "Papua\nNew Guinea",
+                             geographic_region %in% c("Sulawesi", "Maluku Islands", "Indonesia", "West New Guinea") ~ "Indonesia",
+                             geographic_region %in% c("Bougainville Island", "Solomon Islands") ~ "Solomon Is. +\nBougainville Is.",
+                             .default = geographic_region)
+         ) %>%
+  filter(!is.na(country)) %>% 
+  filter(c(country %in% c("Papua\nNew Guinea", "Indonesia", "Solomon Is. +\nBougainville Is.", "Australia"))) # retain only target regions
+
+# retain required variables
+stats_plus_metadata_adjusted_country <- stats_plus_metadata_adjusted_country %>% 
+  select(sample_ID, approximate_genome_completeness, ID_number, species, country, specimen_type) %>% 
+  rename(full_species_name = species,
+         number = ID_number)
+
+metadata_taxa_subset <- metadata_taxa %>% 
+  select(sample_ID, full_species_name, number, Sahul_region, specimen_type)
+
+# add failed samples as zeros (ignore missing novaehollandiae and Mesembriomys gouldii as many excluded due to low recovery given other high-recovery samples)
+add_missing_mtDNA_save <- metadata_taxa_subset %>%
+  filter(!(sample_ID %in% c(stats_plus_metadata$sample_ID))) %>% 
+  filter(!(full_species_name %in% c("Pseudomys_novaehollandiae",
+                                    "Mesembriomys_gouldii"))) %>% 
+  filter(!(sample_ID %in% c("EC6_Pseudomys_delicatulus_M56791_WA_WarrambooCreek", "EC5_Leptomys_paulus_M23838"))) %>% #non rodent samples that were dropped, planigale and bird
+  # remove any replicate samples which have mtDNA
+  filter(!(number %in% stats_plus_metadata$ID_number)) %>% 
+  group_by(number) %>% slice(1) %>% ungroup() %>% # ensure only one observation per individual specimen when multiple libraries per specimen
+  mutate(approximate_genome_completeness = 0)
+
+add_missing_mtDNA <- add_missing_mtDNA_save %>% 
+  mutate(country = case_when(Sahul_region %in% c("East New Guinea", "Bismarck Archipelago") ~ "Papua\nNew Guinea",
+                             Sahul_region %in% c("Sulawesi", "Maluku Islands", "Indonesia", "West New Guinea") ~ "Indonesia",
+                             Sahul_region %in% c("Bougainville Island", "Solomon Islands") ~ "Solomon Is. +\nBougainville Is.",
+                             .default = Sahul_region)
+         ) %>% 
+  filter(!is.na(country)) %>% 
+  filter(c(country %in% c("Papua\nNew Guinea", "Indonesia", "Solomon Is. +\nBougainville Is.", "Australia"))) # retain only target regions
+
+stats_plus_metadata_adjusted_country <- bind_rows(stats_plus_metadata_adjusted_country, add_missing_mtDNA)
+
+stats_plus_metadata_adjusted_country %>% group_by(country) %>% summarise(n = n())
+```
+
+```{r}
+oneway.test(approximate_genome_completeness ~ country, data = stats_plus_metadata_adjusted_country, var.equal = FALSE)
+
+# ANOVA is significant (completeness depends on geography)
+
+# isolate significance post-HOC (use Games-Howell to account for unequal sampling and variance)
+rstatix::games_howell_test(data = stats_plus_metadata_adjusted_country, approximate_genome_completeness ~ country, detailed = T) %>% 
+  filter(p.adj.signif != "ns")
+
+stats_plus_metadata_adjusted_country %>%
+  group_by(country) %>% 
+  summarise(mean = mean(approximate_genome_completeness),
+            SD = sd(approximate_genome_completeness))
+```
+
+
+# historical vs modern specimens statistical analysis
+
+```{r}
+historical_vs_modern <- bind_rows(stats_plus_metadata, add_missing_mtDNA_save)
+
+stat_test <- wilcox.test((historical_vs_modern %>% filter(specimen_type == "historical"))$approximate_genome_completeness,
+            (historical_vs_modern %>% filter(specimen_type != "historical"))$approximate_genome_completeness)
+
+stat_test
+stat_test$p.value
+
+historical_vs_modern %>% 
+            group_by(specimen_type) %>% 
+            summarise(count = n(),
+            mean = mean(approximate_genome_completeness),
+            SD = sd(approximate_genome_completeness))
+```
+
+# phylogenetic information content statistical analyses
+
+```{r}
+# load data
+reciprocally_monophyletic <- read_csv("reciprocal_monophyly_for_correlation_plots.csv")
+```
+
+
+## Reciprocal Monophyly vs Bootstrap score
+
+```{r}
+# bootstrap vs RM
+bootstrap_RM_model <- lm(proportion ~ average_bootstrap_score,
+                         data = reciprocally_monophyletic %>%
+                           filter(length == "200"))
+
+bootstrap_RM_model
+
+paste("R_squared =", signif(broom::glance(bootstrap_RM_model)$adj.r.squared, 2))
+paste("p =", signif(broom::glance(bootstrap_RM_model)$p.value, 2))
+```
+
+
+## Reciprocal Monophyly vs Parsimony
+
+```{r}
+# RM vs parsimony sites
+RM_site_model <- lm(proportion ~ parsimony_sites,
+                    data = reciprocally_monophyletic %>%
+                    filter(length == "200"),
+                    weights = total_clades)
+
+RM_site_model
+
+paste("R_squared =", signif(broom::glance(RM_site_model)$adj.r.squared, 2))
+paste("p =", signif(broom::glance(RM_site_model)$p.value, 2))
+```
+
+## Bootstrap Vs Parsimony
+
+```{r}
+# bootstrap vs parsimony sites
+bootstrap_site_model <- lm(average_bootstrap_score ~ parsimony_sites,
+                         data = reciprocally_monophyletic %>%
+                           filter(length == "200"))
+
+bootstrap_site_model
+
+paste("R_squared =", signif(broom::glance(bootstrap_site_model)$adj.r.squared, 2))
+paste("p =", signif(broom::glance(bootstrap_site_model)$p.value, 2))
+```
+
+### Reciprocal monophyly vs Branch Length
+
+```{r}
+# Read in files
+overall_reciprocal_monophyly <- read_csv("overall_reciprocal_monophyly_across_windows.csv")
+
+# read divergence to sister clade calculated from time calibrated tree in Roycroft et al., 2022
+nuclear_sister_divergences <- read_csv("divergence_to_sister_based_on_time_cal_tree_Roycroft_etal_2022.csv")
+```
+
+```{r}
+# calculate clade RM proportion
+clade_RM_proportion <- overall_reciprocal_monophyly %>% 
+  filter(is.na(barcode), length == 200) %>% # retain only 200bp controlled windows
+  # convert reciprocal monophyly to 0 and 1 rather than no and yes to enable calculation of proportion using mean
+  mutate(reciprocal_monophyly = case_when(reciprocal_monophyly == "yes" ~ 1,
+                                          .default = 0)) %>% 
+  group_by(clade) %>% 
+  summarise(proportion = mean(reciprocal_monophyly),
+            num_windows = n_distinct(window),
+            windows_included = num_windows/n_distinct((overall_reciprocal_monophyly %>% filter(is.na(barcode), length == 200))$window))
+  
+# join clade proportion to nuclear clade divergences
+reciprocal_monophyly_by_divergence <- inner_join(nuclear_sister_divergences, clade_RM_proportion, join_by(clade))
+
+# plot branch length against reciprocal monophyly
+RM_divergence_model <- glm(proportion ~ length, 
+                           data = reciprocal_monophyly_by_divergence,
+                           weights = num_windows,
+                           family = "quasibinomial")
+
+p_value <- (broom::tidy(RM_divergence_model) %>% filter(term == "length"))$p.value
+
+#Efron's Pseudo-R2
+predicted <- predict(RM_divergence_model, type = "response")
+r_squared <- 1 - (sum((RM_divergence_model$y - predicted)^2) / sum((RM_divergence_model$y - mean(RM_divergence_model$y))^2)) # 1 - SUM((yi - pred. yi)^2) / SUM((yi - mean(yi))^2)
+
+r_squared <- signif(r_squared, 2)
+p_value <- signif(p_value, 2)
+
+
+
+RM_divergence_model
+
+paste("R_squared =", r_squared)
+paste("p =", p_value)
+```
+
+## Reciprocal monophyly vs Sequence Length
+
+```{r}
+# create loci_sequence region ID variable
+reciprocally_monophyletic <- reciprocally_monophyletic %>% 
+  mutate(loci_sequence_region_ID =
+           case_when(!is.na(sequence_region_ID) ~ paste(loci, sequence_region_ID, sep = "_"),
+                     .default = NA)) %>% 
+  mutate(length = as.factor(length))
+
+paired_windows <- reciprocally_monophyletic %>% 
+  filter(length == "100" | length == "200") %>% 
+  arrange(loci_sequence_region_ID, length) %>% 
+  select(loci_sequence_region_ID, length, proportion) %>% 
+  pivot_wider(names_from = length,
+              values_from = proportion)
+
+save_RM_paired_windows <- paired_windows
+
+paired_windows <- t.test(paired_windows$`100`, paired_windows$`200`, paired = T)
+
+paired_windows
+```
