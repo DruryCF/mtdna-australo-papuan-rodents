@@ -22,11 +22,6 @@ gene_trees_suffix <- "_250729_trimmed_rooted_updated_tips.treefile"
 gene_list <- c("s-rRNA", "l-rRNA", "ND1", "ND2", "COX1", "COX2", "ATP8", "ATP6", "COX3", "ND3", "ND4L", "ND4", "ND5", "ND6", "CYTB")
 levels(gene_list) <- gene_list
 
-# bootstrap analysis trees
-taxa_length_controlled_trees_folder_path <- "length_taxonomy_control/trees/"
-taxa_length_controlled_trees_prefix <- "length_taxonomy_control_"
-taxa_length_controlled_trees_suffix <- "_trimmed_rooted_updated_tips.treefile"
-
 # read in IQTREE file metadata for 200bp length windows
 IQTREE_metadata <- read_csv("rodent_loci_windows/IQTREE_200bp_metadata.csv")
 # get unique rows
